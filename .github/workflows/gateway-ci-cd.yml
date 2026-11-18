@@ -1,0 +1,43 @@
+name: Gateway CI/CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  CI-CD:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Test and package Gateway
+        run: bash ./gradlew clean test bootJar
+
+      - name: Build Docker image
+        run: docker build --tag "gateway:${GITHUB_RUN_NUMBER}" .
+
+      - name: Publish Gateway image to Docker Hub
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          printf '%s\n' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          image="$DOCKER_USERNAME/gateway:$GITHUB_RUN_NUMBER"
+          docker tag "gateway:$GITHUB_RUN_NUMBER" "$image"
+          docker push "$image"
