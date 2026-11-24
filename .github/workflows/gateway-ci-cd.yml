@@ -1,43 +1,223 @@
-name: Gateway CI/CD
+name: gateway CI/CD
 
+# dev 또는 main 대상 PR이 닫히면 머지 여부를 확인한다.
 on:
-  push:
-    branches: [main]
+  pull_request:
+    branches: [dev, main]
+    types: [closed]
 
 permissions:
   contents: read
 
+# 같은 대상 브랜치의 배포가 동시에 진행되지 않도록 한다.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.base.ref }}-${{ github.event.pull_request.merged }}
   cancel-in-progress: false
 
-jobs:
-  CI-CD:
-    runs-on: ubuntu-latest
+env:
+  JAVA_VERSION: ${{ vars.JAVA_VERSION || '17' }}
 
+jobs:
+  publish:
+    # 실제로 머지된 PR만 빌드한다.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    # 배포 작업에 게시된 이미지의 digest만 전달한다.
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           persist-credentials: false
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      - name: Test and package Gateway
+      - name: 테스트 및 실행 JAR 생성
         run: bash ./gradlew clean test bootJar
 
-      - name: Build Docker image
-        run: docker build --tag "gateway:${GITHUB_RUN_NUMBER}" .
+      # 개발 PC와 EC2에서 사용할 amd64·arm64 Linux 이미지를 함께 빌드한다.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Publish Gateway image to Docker Hub
+      # 이미지 태그에는 머지 커밋 SHA를 사용하고, 배포할 때는 digest로 이미지를 고정한다.
+      - name: Docker Hub 이미지 게시
+        id: publish
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
-          printf '%s\n' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
-          image="$DOCKER_USERNAME/gateway:$GITHUB_RUN_NUMBER"
-          docker tag "gateway:$GITHUB_RUN_NUMBER" "$image"
-          docker push "$image"
+          set -euo pipefail
+          image="${IMAGE_REPOSITORY:-$DOCKER_USERNAME/gateway}"
+          printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          docker buildx build --platform linux/amd64,linux/arm64 --push --build-arg "JAVA_VERSION=$JAVA_VERSION" \
+            --tag "$image:$MERGE_SHA" --metadata-file "$RUNNER_TEMP/image.json" .
+          digest=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/image.json")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    # 테스트, JAR 빌드, 이미지 게시가 모두 성공해야 배포를 시작한다.
+    needs: publish
+    # dev는 개발 PC의 러너에서 실행하고, main은 GitHub 러너에서 EC2에 접속한다.
+    runs-on: ${{ github.event.pull_request.base.ref == 'dev' && 'self-hosted' || 'ubuntu-latest' }}
+    # 브랜치에 맞는 GitHub Environment에서 앱 환경변수와 배포 포트를 읽는다.
+    environment: ${{ github.event.pull_request.base.ref == 'dev' && 'development' || 'production' }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+      SERVICE_NETWORK: ${{ vars.SERVICE_NETWORK || 'kgb-services' }}
+      SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+      HOST_PORT: ${{ vars.HOST_PORT || vars.GATEWAY_PORT || '8000' }}
+      APP_PORT: ${{ vars.APP_PORT || '8000' }}
+      HEALTH_PATH: ${{ vars.HEALTH_PATH || '/swagger-ui/index.html' }}
+    steps:
+      # Windows에서는 시스템 Bash 대신 Git for Windows의 Bash를 우선 사용한다.
+      - name: Windows 배포 셸 설정
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          @echo off
+          setlocal
+          chcp 65001 >nul
+          set "GIT_BIN="
+          for /f "delims=" %%G in ('git --exec-path') do for %%B in ("%%G\..\..\..\bin") do set "GIT_BIN=%%~fB"
+          if not defined GIT_BIN exit /b 1
+          if not exist "%GIT_BIN%\bash.exe" exit /b 1
+          >>"%GITHUB_PATH%" echo(%GIT_BIN%
+
+      # main 배포에 사용할 EC2 호스트 키를 검증하도록 설정하고 Docker 연결을 SSH로 전환한다.
+      - name: EC2 Docker 연결 준비
+        if: github.event.pull_request.base.ref == 'main'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p -m 700 ~/.ssh
+          (umask 077; printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_deploy)
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host deploy-production\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' \
+            "$EC2_HOST" "$EC2_USER" >> ~/.ssh/config
+          echo 'DOCKER_HOST=ssh://deploy-production' >> "$GITHUB_ENV"
+
+      # 앱 환경 파일과 Docker 인증 정보는 임시 디렉터리에 보관하고 단계 종료 시 정리한다.
+      - name: 이미지 배포 및 상태 확인
+        env:
+          DEV_RUNNER_NAME: ${{ vars.DEV_RUNNER_NAME || 'G28' }}
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+          IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+          APP_ENV: ${{ secrets.APP_ENV || secrets.GATEWAY_ENV }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY##*/}"
+          if [[ "$TARGET_BRANCH" == "dev" ]]; then
+            [[ "$RUNNER_NAME" == "$DEV_RUNNER_NAME" ]] || { echo "Expected $DEV_RUNNER_NAME, got $RUNNER_NAME"; exit 1; }
+            unset DOCKER_CONTEXT
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              export DOCKER_HOST=npipe:////./pipe/docker_engine
+            else
+              export DOCKER_HOST=unix:///var/run/docker.sock
+            fi
+            echo "Deploying on $RUNNER_NAME using local Docker"
+          fi
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Missing or invalid published digest"; exit 1; }
+          export IMAGE="${IMAGE_REPOSITORY:-$DOCKER_USERNAME/gateway}@$IMAGE_DIGEST"
+          project="${SERVICE_NAME:-${repo,,}}"
+          [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo 'Invalid Compose project name'; exit 1; }
+          umask 077
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          export DOCKER_CONFIG="$work/docker"
+          mkdir "$DOCKER_CONFIG"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then export DOCKER_CONFIG="$(cygpath -w "$DOCKER_CONFIG")"; fi
+          printf '%s\n' "$APP_ENV" > "$work/app.env"
+          printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          docker network inspect "$SERVICE_NETWORK" >/dev/null 2>&1 || docker network create "$SERVICE_NETWORK" || docker network inspect "$SERVICE_NETWORK" >/dev/null
+          if [[ "$TARGET_BRANCH" == "dev" ]]; then
+            docker pull "$IMAGE"
+            # 이 서비스가 이전에 실행한 컨테이너만 교체한다.
+            previous=$(docker ps -aq --filter "label=dev.service=$project")
+            if [[ -z "$previous" ]]; then
+              previous=$(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=app")
+            fi
+            [[ "$previous" != *$'\n'* ]] || { echo "Multiple previous containers; check the deployment target"; exit 1; }
+            name="$project-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            env_file="$work/app.env"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then env_file="$(cygpath -w "$env_file")"; fi
+            was_running=false
+            if [[ -n "$previous" ]]; then
+              was_running=$(docker inspect --format '{{.State.Running}}' "$previous")
+              if [[ "$was_running" == true ]]; then docker stop "$previous"; fi
+            fi
+            rollback() {
+              docker rm -f "$name" >/dev/null 2>&1 || true
+              if [[ "$was_running" == true ]]; then docker start "$previous"; fi
+            }
+            trap rollback ERR
+            # Git Bash가 컨테이너 내부의 Linux 경로를 Windows 경로로 변환하지 않게 한다.
+            MSYS2_ARG_CONV_EXCL="*" docker run -d --name "$name" --label "dev.service=$project" --restart unless-stopped \
+              --network "$SERVICE_NETWORK" --network-alias gateway --env-file "$env_file" -e "SERVER_PORT=$APP_PORT" -e "DEPLOY_HEALTH_PATH=$HEALTH_PATH" \
+              -p "$HOST_PORT:$APP_PORT" --health-interval 10s --health-timeout 6s \
+              --health-start-period 45s --health-retries 7 \
+              --health-cmd 'curl -fsS --max-time 5 "http://localhost:$SERVER_PORT$DEPLOY_HEALTH_PATH" >/dev/null' "$IMAGE"
+            deadline=$((SECONDS + 150))
+            while (( SECONDS < deadline )); do
+              state=$(docker inspect --format '{{.State.Status}}/{{.State.Health.Status}}' "$name")
+              case "$state" in
+                running/healthy) break ;;
+                running/starting) sleep 3 ;;
+                *) break ;;
+              esac
+            done
+            if [[ "$state" != "running/healthy" ]]; then
+              echo "Container $name failed health check: $state"
+              rollback
+              exit 1
+            fi
+            trap - ERR
+            if [[ -n "$previous" ]]; then docker rm "$previous"; fi
+            docker ps --filter "id=$(docker inspect --format '{{.Id}}' "$name")" --format '{{.Names}} {{.Status}} {{.Ports}}'
+            exit 0
+          fi
+          # EC2 배포에 사용할 Compose 설정을 생성한다.
+          cat > "$work/compose.yaml" <<'COMPOSE'
+          services:
+            app:
+              image: ${IMAGE:?IMAGE is required}
+              restart: unless-stopped
+              networks:
+                default:
+                  aliases: [gateway]
+              env_file:
+                - path: ./app.env
+                  format: raw
+              environment:
+                SERVER_PORT: "${APP_PORT:-8000}"
+              ports:
+                - "${HOST_PORT:-8000}:${APP_PORT:-8000}"
+              healthcheck:
+                test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://localhost:${APP_PORT:-8000}${HEALTH_PATH:-/swagger-ui/index.html}"]
+                interval: 10s
+                timeout: 6s
+                start_period: 45s
+                retries: 7
+          networks:
+            default:
+              external: true
+              name: ${SERVICE_NETWORK}
+          COMPOSE
+          docker compose -p "$project" -f "$work/compose.yaml" pull
+          docker compose -p "$project" -f "$work/compose.yaml" up -d --remove-orphans --wait --wait-timeout 150
+          docker compose -p "$project" -f "$work/compose.yaml" ps app
