@@ -237,6 +237,21 @@ jobs:
               name: ${SERVICE_NETWORK}
           COMPOSE
           docker compose -p "$project" -f "$work/compose.yaml" pull
+          # 현재 운영 레지스트리의 등록 상태를 컨테이너 교체 전에 기록한다.
+          if registry=$(docker exec eureka curl -fsS --max-time 5 -H 'Accept: application/json' http://localhost:8761/eureka/apps); then
+            jq -r '[.applications.application[]? | .name as $name | .instance[]? | "\($name)=\(.status)"] | "Before deployment: \(join(", "))"' <<< "$registry"
+          fi
           docker compose -p "$project" -f "$work/compose.yaml" up -d --remove-orphans --wait --wait-timeout 150
           docker compose -p "$project" -f "$work/compose.yaml" ps app
           docker network inspect "$SERVICE_NETWORK" --format '{{range .Containers}}{{println .Name}}{{end}}' | grep -Fx gateway
+          registry_url=http://eureka:8761/eureka/apps/GATEWAY
+          container_ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "louie-kury-network").IPAddress}}' gateway)
+          for attempt in {1..24}; do
+            if docker exec gateway curl -fsS --max-time 5 -H 'Accept: application/json' "$registry_url" |
+              jq -e --arg ip "$container_ip" --arg port "$APP_PORT" 'any(.application.instance[]?; .status == "UP" and .ipAddr == $ip and (.port."$" | tostring) == $port)' >/dev/null; then
+              echo "GATEWAY is UP in Eureka at the deployed container IP and port"
+              break
+            fi
+            if [[ "$attempt" == 24 ]]; then echo "GATEWAY did not register its current endpoint as UP"; exit 1; fi
+            sleep 5
+          done
