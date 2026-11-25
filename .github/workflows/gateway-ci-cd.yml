@@ -73,7 +73,7 @@ jobs:
         shell: bash
     env:
       IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
-      SERVICE_NETWORK: kgb-services
+      SERVICE_NETWORK: ${{ github.event.pull_request.base.ref == 'main' && 'louie-kury-network' || 'kgb-services' }}
       SERVICE_NAME: ${{ vars.SERVICE_NAME }}
       HOST_PORT: ${{ vars.HOST_PORT || vars.GATEWAY_PORT || '8000' }}
       APP_PORT: ${{ vars.APP_PORT || '8000' }}
@@ -232,3 +232,4 @@ jobs:
           docker compose -p "$project" -f "$work/compose.yaml" pull
           docker compose -p "$project" -f "$work/compose.yaml" up -d --remove-orphans --wait --wait-timeout 150
           docker compose -p "$project" -f "$work/compose.yaml" ps app
+          docker network inspect "$SERVICE_NETWORK" --format '{{range .Containers}}{{println .Name}}{{end}}' | grep -Fx gateway
