@@ -153,6 +153,9 @@ jobs:
               previous=$(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=app")
             fi
             [[ "$previous" != *$'\n'* ]] || { echo "Multiple previous containers; check the deployment target"; exit 1; }
+            service_name=gateway
+            owner=$(docker ps -aq --no-trunc --filter "name=^/${service_name}$")
+            if [[ -n "$owner" && ( -z "$previous" || "$owner" != "$previous"* ) ]]; then echo "Container name $service_name already in use"; exit 1; fi
             name="$project-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
             env_file="$work/app.env"
             if [[ "$RUNNER_OS" == "Windows" ]]; then env_file="$(cygpath -w "$env_file")"; fi
@@ -186,6 +189,13 @@ jobs:
               rollback
               exit 1
             fi
+            if [[ -n "$owner" ]]; then docker rename "$previous" "$name-previous"; fi
+            if ! docker rename "$name" "$service_name"; then
+              if [[ -n "$owner" ]]; then docker rename "$previous" "$service_name"; fi
+              rollback
+              exit 1
+            fi
+            name="$service_name"
             trap - ERR
             if [[ -n "$previous" ]]; then docker rm "$previous"; fi
             docker ps --filter "id=$(docker inspect --format '{{.Id}}' "$name")" --format '{{.Names}} {{.Status}} {{.Ports}}'
@@ -195,6 +205,7 @@ jobs:
           cat > "$work/compose.yaml" <<'COMPOSE'
           services:
             app:
+              container_name: gateway
               image: ${IMAGE:?IMAGE is required}
               restart: unless-stopped
               networks:
