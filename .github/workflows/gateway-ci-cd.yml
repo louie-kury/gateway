@@ -73,7 +73,7 @@ jobs:
         shell: bash
     env:
       IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
-      SERVICE_NETWORK: ${{ vars.SERVICE_NETWORK || 'kgb-services' }}
+      SERVICE_NETWORK: kgb-services
       SERVICE_NAME: ${{ vars.SERVICE_NAME }}
       HOST_PORT: ${{ vars.HOST_PORT || vars.GATEWAY_PORT || '8000' }}
       APP_PORT: ${{ vars.APP_PORT || '8000' }}
