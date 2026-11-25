@@ -105,7 +105,14 @@ jobs:
           set -euo pipefail
           mkdir -p -m 700 ~/.ssh
           (umask 077; printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_deploy)
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # Accept the trusted EC2 public host key or a complete known_hosts file.
+          trusted_hosts=$(printf '%s\n' "$EC2_KNOWN_HOSTS" | tr -d '\r')
+          if [[ "$trusted_hosts" != *$'\n'* && "$trusted_hosts" =~ ^[[:space:]]*(ssh-ed25519[[:space:]]+[^[:space:]]+) ]]; then
+            printf '%s %s\n' "$EC2_HOST" "${BASH_REMATCH[1]}" > ~/.ssh/known_hosts
+          else
+            printf '%s\n' "$trusted_hosts" > ~/.ssh/known_hosts
+          fi
+          ssh-keygen -F "$EC2_HOST" -f ~/.ssh/known_hosts >/dev/null || { echo "EC2_KNOWN_HOSTS has no entry for EC2_HOST"; exit 1; }
           printf 'Host deploy-production\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' \
             "$EC2_HOST" "$EC2_USER" >> ~/.ssh/config
           echo 'DOCKER_HOST=ssh://deploy-production' >> "$GITHUB_ENV"
